@@ -1,0 +1,31 @@
+# Organizer-only prototype, not part of the participant repo
+prototype/
+
+# Secrets and local config
+.env
+backend/.env
+**/.env
+!.env.example
+
+# Python
+backend/.venv/
+backend/data/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+
+# Node
+node_modules/
+frontend/dist/
+dist/
+*.tsbuildinfo
+
+# Editors and local agent settings
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.cursor/
+.claude/

@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Asset Intelligence Copilot</title>
+  <style>
+    :root {
+      --bg: #10140f;
+      --panel: #1a2218;
+      --line: #31402c;
+      --text: #e7f0df;
+      --muted: #9aab90;
+      --accent: #d7a441;
+      --down: #d4654a;
+      --ok: #7dbe6a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--line);
+    }
+    h1 { font-size: 18px; margin: 0; font-weight: 600; }
+    header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+    main { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 70px); }
+    aside { border-right: 1px solid var(--line); padding: 16px; }
+    label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    select, textarea, button {
+      width: 100%;
+      background: #121810;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      font: inherit;
+    }
+    textarea { min-height: 110px; resize: vertical; }
+    button { margin-top: 10px; background: var(--accent); color: #1b1406; border: 0; font-weight: 650; cursor: pointer; }
+    .examples { margin-top: 18px; display: flex; flex-direction: column; gap: 8px; }
+    .examples button { background: transparent; color: var(--text); border: 1px solid var(--line); font-weight: 500; text-align: left; }
+    section { padding: 20px 24px; }
+    .card, table { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+    .card { padding: 16px; max-width: 640px; }
+    .badge { display: inline-block; padding: 4px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+    .down { background: #3a201b; color: var(--down); }
+    .ok { background: #1b2e18; color: var(--ok); }
+    table { width: 100%; border-collapse: collapse; overflow: hidden; }
+    th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); font-size: 14px; }
+    th { color: var(--muted); font-weight: 600; }
+    .meta { color: var(--muted); font-size: 13px; }
+    .bars { display: flex; flex-direction: column; gap: 10px; max-width: 640px; }
+    .bar-row { display: grid; grid-template-columns: 110px 1fr 50px; gap: 8px; align-items: center; }
+    .bar { height: 16px; background: var(--accent); border-radius: 4px; }
+    pre { white-space: pre-wrap; font-family: inherit; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Asset Intelligence Copilot</h1>
+      <p>Today is 16 Oct 2026. Answers come from the loaded field records.</p>
+    </div>
+    <div id="health" class="meta"></div>
+  </header>
+  <main>
+    <aside>
+      <label for="user">Operator</label>
+      <select id="user"></select>
+      <div class="examples" id="examples"></div>
+    </aside>
+    <section>
+      <label for="question">Question</label>
+      <textarea id="question">Is WELL-0001 producing oil right now? Show me its status card.</textarea>
+      <button id="ask">Ask</button>
+      <div id="answer" style="margin-top: 20px"></div>
+    </section>
+  </main>
+  <script>
+    const examples = [
+      "Is WELL-0001 producing oil right now? Show me its status card.",
+      "Which wells in Northeast Block 8 are not producing oil right now?",
+      "Show a line chart of WELL-0001's wellhead temperature for the last 13 weeks.",
+      "How many oil spills has WELL-0001 had in the last 4 years?",
+      "How many days was WELL-0001 down in 2025?",
+      "Which 3 wells in Northeast Block 7 had the most downtime in the last 4 months?",
+      "Show on a map every well in Northeast Block 8 with a real spill in the last 90 days.",
+      "Show a heatmap of 2026 spills by geographic area and month."
+    ];
+    const examplesEl = document.getElementById("examples");
+    examples.forEach((text) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = text;
+      button.onclick = () => { document.getElementById("question").value = text; ask(); };
+      examplesEl.appendChild(button);
+    });
+
+    async function loadUsers() {
+      const users = await (await fetch("/api/users")).json();
+      const select = document.getElementById("user");
+      users.forEach((user) => {
+        const option = document.createElement("option");
+        option.value = user.user_id;
+        option.textContent = `${user.name} · ${user.role.replaceAll("_", " ")}`;
+        if (user.user_id === "U-201") option.selected = true;
+        select.appendChild(option);
+      });
+      const health = await (await fetch("/api/health")).json();
+      document.getElementById("health").textContent = `Mode ${health.mode} · today ${health.today}`;
+    }
+
+    function render(payload) {
+      const root = document.getElementById("answer");
+      const result = payload.result || {};
+      const timing = payload.decision_ms != null
+        ? `<p class="meta">Decision ${payload.decision_ms} ms · Qwen answer ${payload.answer_ms} ms · total ${payload.elapsed_ms} ms</p>`
+        : (payload.elapsed_ms != null ? `<p class="meta">${payload.elapsed_ms} ms</p>` : "");
+      const lead = `${timing}${payload.answer ? `<article class="card" style="margin-bottom:16px"><p>${payload.answer}</p></article>` : ""}`;
+      if (payload.visual === "status") {
+        const down = !result.producing;
+        root.innerHTML = lead + `<article class="card">
+          <div class="badge ${down ? "down" : "ok"}">${down ? "Not producing" : "Producing"}</div>
+          <h2>${result.asset_id} · ${result.well_name}</h2>
+          <p>Wellhead is <strong>${Number(result.delta_c).toFixed(1)} °C</strong> above the air. The ${result.well_type} limit is ${result.producing_delta_c} °C.</p>
+          <p class="meta">Inspection ${result.inspection_id} on ${String(result.inspected_at).slice(0, 10)} by ${result.inspector_name}, ${result.method}.</p>
+          <p>Recorded status: ${result.recorded_status}${result.recorded_status_stale ? " (out of date)" : ""}.</p>
+          <p>${result.reason}</p>
+        </article>`;
+        return;
+      }
+      if (payload.visual === "table" && result.wells) {
+        const rows = result.wells.map((well) => `<tr><td>${well.asset_id}</td><td>${well.delta_c} °C</td><td>${well.recorded_status}${well.recorded_status_stale ? " (out of date)" : ""}</td><td>${well.reason}</td></tr>`).join("");
+        root.innerHTML = lead + `<table><thead><tr><th>Well</th><th>Above air</th><th>Recorded status</th><th>Reason</th></tr></thead><tbody>${rows}</tbody></table>`;
+        return;
+      }
+      if (payload.visual === "table" && result.spills) {
+        const rows = result.spills.map((spill) => `<tr><td>${spill.spill_date}</td><td>${spill.spill_est_volume_bbl} bbl</td><td>${spill.inspection_id}</td></tr>`).join("");
+        root.innerHTML = lead + `<p><strong>${result.count} spills, ${result.total_bbl} barrels.</strong></p><table><thead><tr><th>Date</th><th>Volume</th><th>Inspection</th></tr></thead><tbody>${rows}</tbody></table>`;
+        return;
+      }
+      if (payload.visual === "bar") {
+        const max = Math.max(...result.wells.map((well) => well.downtime_days));
+        root.innerHTML = lead + `<div class="bars">${result.wells.map((well) => `<div class="bar-row"><span>${well.asset_id}</span><div class="bar" style="width:${(well.downtime_days / max) * 100}%"></div><strong>${well.downtime_days}d</strong></div>`).join("")}</div>`;
+        return;
+      }
+      if (payload.visual === "line") {
+        const down = result.not_producing || [];
+        root.innerHTML = lead + `<p>${result.points.length} readings. Not producing: ${down.join(", ") || "none"}.</p><table><thead><tr><th>Date</th><th>Wellhead</th><th>Air</th><th>Producing</th></tr></thead><tbody>${result.points.map((point) => `<tr><td>${String(point.inspected_at).slice(0, 10)}</td><td>${point.wellhead_temp_c}</td><td>${point.ambient_temp_c}</td><td>${point.producing ? "yes" : "no"}</td></tr>`).join("")}</tbody></table>`;
+        return;
+      }
+      if (payload.visual === "map") {
+        const rows = result.pins.map((pin) => `<tr><td>${pin.asset_id}</td><td>${pin.spill_date}</td><td>${pin.spill_est_volume_bbl}</td><td>${pin.lat}, ${pin.lon}</td></tr>`).join("");
+        root.innerHTML = lead + `<p>${result.pins.length} wells.</p><table><thead><tr><th>Well</th><th>Date</th><th>Barrels</th><th>Location</th></tr></thead><tbody>${rows}</tbody></table>`;
+        return;
+      }
+      if (payload.visual === "heatmap") {
+        root.innerHTML = lead + `<table><thead><tr><th>Area</th><th>Month</th><th>Spills</th></tr></thead><tbody>${result.cells.map((cell) => `<tr><td>${cell.area_name}</td><td>${cell.month}</td><td>${cell.spills}</td></tr>`).join("")}</tbody></table>`;
+        return;
+      }
+      root.innerHTML = lead + `<article class="card"><h2>${payload.title || "Answer"}</h2><pre>${JSON.stringify(result, null, 2)}</pre></article>`;
+    }
+
+    async function ask() {
+      const question = document.getElementById("question").value;
+      const user_id = document.getElementById("user").value;
+      document.getElementById("answer").innerHTML = `<p class="meta">Looking through the field records…</p>`;
+      const response = await fetch("/api/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question, user_id })
+      });
+      render(await response.json());
+    }
+    document.getElementById("ask").onclick = ask;
+    loadUsers();
+  </script>
+</body>
+</html>
