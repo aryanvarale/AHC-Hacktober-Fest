@@ -25,9 +25,9 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
-DATA_DIR = Path(os.environ.get("AICOPILOT_DATA", ROOT / "sample-data"))
+DATA_DIR = Path(os.environ.get("AICOPILOT_DATA", ROOT / "test-data" / "dataset"))
 DB_PATH = Path(os.environ.get("AICOPILOT_DB", ROOT / "backend" / "data" / "field.duckdb"))
-TODAY = date.fromisoformat(os.environ.get("AICOPILOT_TODAY", "2026-10-16"))
+TODAY = date.fromisoformat(os.environ.get("AICOPILOT_TODAY", "2027-01-15"))
 
 
 @dataclass(frozen=True)

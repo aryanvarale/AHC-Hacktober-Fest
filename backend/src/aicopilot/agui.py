@@ -61,7 +61,7 @@ def resolve(question: str, memory: dict) -> str:
     out = question
     if not _asset(question) and memory.get("asset") and re.search(r"\b(it|its|that well|this well|same well)\b", low):
         out += f" {memory['asset']}"
-    if memory.get("area") and not any(a in low for a in ("northeast", "southwest")):
+    if memory.get("area") and not any(a in low for a in ("northeast", "northwest", "southeast", "southwest")):
         if re.search(r"\b(there|same area|that area|this area)\b", low):
             out += f" {memory['area']}"
     return out
@@ -72,7 +72,7 @@ def resolve(question: str, memory: dict) -> str:
 
 def _rows(payload: dict) -> list[dict]:
     result = payload.get("result") or {}
-    for key in ("suggestions", "wells", "spills", "points", "inspections", "pins", "cells", "types", "sops", "breakdown", "rows"):
+    for key in ("suggestions", "wells", "spills", "points", "inspections", "pins", "cells", "types", "sops", "breakdown", "rows", "changes"):
         if isinstance(result.get(key), list) and result[key]:
             return result[key]
     return []
@@ -103,8 +103,8 @@ def _line_points(rows: list[dict]) -> list[dict]:
     for r in rows:
         if "wellhead_temp_c" in r:
             out.append({"x": str(r.get("inspected_at") or r.get("inspected_on"))[:10], "a": r["wellhead_temp_c"], "b": r.get("ambient_temp_c"), "flag": not r.get("producing", True)})
-        elif "spill_est_volume_bbl" in r:
-            out.append({"x": str(r["spill_date"])[:10], "a": r["spill_est_volume_bbl"], "b": None, "flag": False})
+        elif "spill_est_volume_bbl" in r and (r.get("spill_date") or r.get("inspected_at")):
+            out.append({"x": str(r.get("spill_date") or r.get("inspected_at"))[:10], "a": r["spill_est_volume_bbl"], "b": None, "flag": False})
     return out
 
 
@@ -162,7 +162,9 @@ def _default_visual(payload: dict) -> str:
         return "map"
     if tool == "spill_heatmap":
         return "heatmap"
-    if tool in {"evaluate_reading", "well_type_rules", "fleet_summary", "repair_cost"} and _rows(payload):
+    if tool in {"record_correction", "record_rule", "record_note"}:
+        return "table"  # what was changed: before, after, and who said so
+    if tool in {"evaluate_reading", "well_type_rules", "fleet_summary", "repair_cost", "repair_kinds", "flowline_bypasses", "spill_letter_compliance", "data_availability"} and _rows(payload):
         return "table"  # one row per well type or group: easier to compare than a sentence
     if tool == "data_query" and len(_rows(payload)) > 1:
         return "table"
@@ -175,6 +177,10 @@ def _table_columns(tool: str | None, rows: list[dict]) -> list[str]:
         "spills_for_well": ["spill_date", "spill_est_volume_bbl", "inspection_id"],
         "top_downtime": ["asset_id", "well_type", "downtime_days", "last_down_inspection"],
         "timeseries": ["inspected_at", "wellhead_temp_c", "ambient_temp_c", "delta_c", "producing"],
+        "repair_kinds": ["equipment", "repair", "kind", "jobs", "wells"],
+        "fleet_summary": ["well_type", "wells"],
+        "flowline_bypasses": ["Well", "Area", "Bypass in", "Bypass out", "Approval", "Approval valid until", "Status"],
+        "spill_letter_compliance": ["Well", "Area", "Spill date", "Barrels", "Clean-up report", "Status", "Why"],
     }.get(tool, [])
     if rows and rows[0].get("asset_id") and not preferred:
         preferred = ["asset_id", "status", "area", "delta_c", "inspection_id"]
@@ -293,6 +299,10 @@ def nice_title(payload: dict) -> str:
         "evaluate_reading": f"Hypothetical reading: {r.get('reading', {}).get('gap_c')} °C above the air",
         "well_type_rules": "Operating rules from the manuals",
         "fleet_summary": "The dataset at a glance",
+        "spill_letter_compliance": "Spills covered by the Commission's letter",
+        "record_correction": "Correction recorded",
+        "record_rule": "Rule recorded",
+        "record_note": "Note recorded for everyone",
         "repair_cost": f"Maintenance cost in {r.get('year')}",
         "data_query": "From the field database",
         "temperature_status": f"Temperature at {asset} ({r.get('well_name')})",
@@ -424,7 +434,7 @@ def stream_run(body: dict, compute: Callable[..., dict], remember: Callable[...,
             wanted
             and memory.get("last")
             and not _asset(question)
-            and not any(a in low for a in ("northeast", "southwest"))
+            and not any(a in low for a in ("northeast", "northwest", "southeast", "southwest"))
             and re.search(r"\b(it|that|this|them|these|same|again)\b", low)
         )
         # "show it as a table": same data, new visual. No new tool call.

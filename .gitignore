@@ -1,6 +1,10 @@
 # Organizer-only prototype, not part of the participant repo
 prototype/
 
+# Field datasets stay local. The app reads test-data/dataset; sample-data is the earlier set.
+sample-data/
+test-data/
+
 # Secrets and local config
 .env
 backend/.env

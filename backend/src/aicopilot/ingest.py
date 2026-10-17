@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import csv
 import json
+import os
+import re
+import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import duckdb
@@ -87,11 +92,63 @@ WHERE spill_detected
 """
 
 
+NULL_MARK = "\\N"   # how a missing value is written in the temporary CSV
+
+
+def _many(con: duckdb.DuckDBPyConnection, sql: str, rows) -> None:
+    """Load rows through a temporary CSV and DuckDB's own COPY.
+
+    Passing rows as Python parameters (executemany, or big VALUES lists) makes the DuckDB bridge probe for optional
+    modules on every value, which took 96 % of the time and 11 minutes for the test dataset. COPY reads the file natively.
+    """
+    rows = list(rows)
+    if not rows:
+        return
+    table = re.search(r"INSERT INTO (\w+)", sql).group(1)
+    handle, name = tempfile.mkstemp(suffix=".csv")
+    os.close(handle)
+    try:
+        with open(name, "w", newline="", encoding="utf-8") as out:
+            writer = csv.writer(out)
+            for row in rows:
+                writer.writerow([NULL_MARK if v is None else (str(v).lower() if isinstance(v, bool) else v) for v in row])
+        path = name.replace("\\", "/").replace("'", "''")
+        con.execute(f"COPY {table} FROM '{path}' (FORMAT csv, HEADER false, NULL '{NULL_MARK}')")
+    finally:
+        os.unlink(name)
+
+
+def is_complete(db_path: Path) -> bool:
+    """True only for a database that was fully built. A file left behind by an interrupted load is not."""
+    if not db_path.exists():
+        return False
+    try:
+        con = duckdb.connect(str(db_path), read_only=True)
+    except Exception:
+        return False
+    try:
+        try:
+            return con.execute("SELECT count(*) FROM ingest_meta").fetchone()[0] > 0
+        except Exception:
+            # built before the marker existed: accept it only if every core table has rows
+            return all(con.execute(f"SELECT count(*) FROM {t}").fetchone()[0] > 0 for t in ("wells", "inspections", "maintenance", "rules"))
+    except Exception:
+        return False
+    finally:
+        con.close()
+
+
 def ingest(data_dir: Path, db_path: Path) -> dict:
+    """Build the database from the data folder.
+
+    It is built in a separate file and moved over the real one only when every table is loaded, so an
+    interruption (a restart, a killed process) can never leave a half-loaded database behind.
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    if db_path.exists():
-        db_path.unlink()
-    con = duckdb.connect(str(db_path))
+    building = db_path.with_name(db_path.name + ".building")
+    for leftover in (building, Path(str(building) + ".wal")):
+        leftover.unlink(missing_ok=True)
+    con = duckdb.connect(str(building))
     try:
         _create_tables(con)
         _load_fleet(con, data_dir / "fleet")
@@ -108,9 +165,17 @@ def ingest(data_dir: Path, db_path: Path) -> dict:
                 "corrections", "rules", "report_facts",
             )
         }
-        return counts
-    finally:
+        con.execute("CREATE TABLE ingest_meta (finished_at TIMESTAMP, data_dir VARCHAR, wells BIGINT, inspections BIGINT)")
+        con.execute("INSERT INTO ingest_meta VALUES (?, ?, ?, ?)", [datetime.now(), str(data_dir), counts["wells"], counts["inspections"]])
+    except BaseException:
         con.close()
+        building.unlink(missing_ok=True)
+        Path(str(building) + ".wal").unlink(missing_ok=True)
+        raise
+    con.close()
+    Path(str(db_path) + ".wal").unlink(missing_ok=True)   # a stale log from the file being replaced
+    os.replace(building, db_path)
+    return counts
 
 
 def _create_tables(con: duckdb.DuckDBPyConnection) -> None:
@@ -268,16 +333,16 @@ def _create_tables(con: duckdb.DuckDBPyConnection) -> None:
 
 def _load_fleet(con: duckdb.DuckDBPyConnection, fleet: Path) -> None:
     areas = json.loads((fleet / "areas.json").read_text(encoding="utf-8"))
-    con.executemany(
+    _many(con, 
         "INSERT INTO areas VALUES (?, ?, ?, ?, ?)",
         [(a["area_id"], a["name"], a["team_id"], a["center"]["lat"], a["center"]["lon"]) for a in areas["areas"]],
     )
-    con.executemany(
+    _many(con, 
         "INSERT INTO teams VALUES (?, ?, ?)",
         [(t["team_id"], t["name"], t["lead_user_id"]) for t in areas["teams"]],
     )
     users = json.loads((fleet / "users.json").read_text(encoding="utf-8"))
-    con.executemany(
+    _many(con, 
         "INSERT INTO users VALUES (?, ?, ?, ?)",
         [(u["user_id"], u["name"], u["role"], u["team_id"]) for u in users["users"]],
     )
@@ -298,8 +363,8 @@ def _load_wells(con: duckdb.DuckDBPyConnection, assets: Path) -> None:
         ))
         for item in meta.get("equipment", []):
             equipment.append((item["equipment_id"], meta["asset_id"], item["kind"], item["model"]))
-    con.executemany("INSERT INTO wells VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", wells)
-    con.executemany("INSERT INTO equipment VALUES (?, ?, ?, ?)", equipment)
+    _many(con, "INSERT INTO wells VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", wells)
+    _many(con, "INSERT INTO equipment VALUES (?, ?, ?, ?)", equipment)
 
 
 def _load_jsonl(con: duckdb.DuckDBPyConnection, assets: Path) -> None:
@@ -307,6 +372,7 @@ def _load_jsonl(con: duckdb.DuckDBPyConnection, assets: Path) -> None:
     maintenance = []
     events = []
     notes = []
+    corrections = []
     for path in sorted(assets.glob("*/inspections.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
@@ -351,10 +417,18 @@ def _load_jsonl(con: duckdb.DuckDBPyConnection, assets: Path) -> None:
                 row.get("note_type"), row.get("inspection_id"), row.get("text"),
                 row.get("valid_from"), row.get("valid_to"),
             ))
-    con.executemany("INSERT INTO inspections VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", inspections)
-    con.executemany("INSERT INTO maintenance VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", maintenance)
-    con.executemany("INSERT INTO reg_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", events)
-    con.executemany("INSERT INTO notes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", notes)
+            if row.get("note_type") == "data_correction" and row.get("inspection_id") and row.get("field"):
+                corrections.append((
+                    f"CORR-{row['note_id']}", row["asset_id"], row["inspection_id"], row["field"],
+                    str(row.get("original_value")), str(row.get("corrected_value")),
+                    row.get("author_user_id"), row.get("text") or "", "record", row["created_at"], "dataset",
+                ))
+    _many(con, "INSERT INTO inspections VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", inspections)
+    _many(con, "INSERT INTO maintenance VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", maintenance)
+    _many(con, "INSERT INTO reg_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", events)
+    _many(con, "INSERT INTO notes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", notes)
+    if corrections:
+        _many(con, "INSERT INTO corrections VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", corrections)
 
 
 def _seed_corrections(con: duckdb.DuckDBPyConnection) -> None:
@@ -375,12 +449,12 @@ def _seed_corrections(con: duckdb.DuckDBPyConnection) -> None:
                 str(bool(original)).lower(), "false", author, text, "record", created_at, "dataset",
             ))
     if seeded:
-        con.executemany("INSERT INTO corrections VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", seeded)
+        _many(con, "INSERT INTO corrections VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", seeded)
 
 
 def _load_rules(con: duckdb.DuckDBPyConnection, fleet: Path) -> None:
     rules = extract_rules(fleet)
-    con.executemany(
+    _many(con, 
         "INSERT INTO rules VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [(r["rule_id"], r["source_doc"], r["scope_type"], r["scope_value"], r["parameter"],
           r["numeric_value"], r["unit"], r["citation"]) for r in rules],
@@ -391,7 +465,7 @@ def _load_report_facts(con: duckdb.DuckDBPyConnection, assets: Path) -> None:
     facts = extract_report_facts(assets)
     if not facts:
         return
-    con.executemany(
+    _many(con, 
         "INSERT INTO report_facts VALUES (?, ?, ?, ?, ?)",
         [(f["maintenance_id"], f["asset_id"], f["inspection_id"], f["containment_hours"], f["report_file"])
          for f in facts],

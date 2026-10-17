@@ -41,7 +41,15 @@ _RULE_WORDS = re.compile(
 )
 _RULE_SUBJECT = re.compile(r"\b(well types?|types? of wells?|manuals?|sops?|procedures?|regulations?|spills?)\b", re.I)
 _COUNT_WELLS = re.compile(
-    r"\b(how many|number of|count of|total (?:number of )?|how large|size of)\b[^?.]*\bwells?\b|\bwells?\b[^?.]*\b(?:in|across) (?:the |this |our )?(?:dataset|data set|database|field|fleet|system)\b",
+    r"\b(?:how many|number of|count of|total(?: number of)?)\s+wells?\b"
+    r"|\b(?:how large|size of)\b[^?.]*\b(?:dataset|data set|database|fleet)\b"
+    r"|\bwells?\b[^?.]*\b(?:in|across) (?:the |this |our )?(?:dataset|data set|database|fleet|system)\b",
+    re.I,
+)
+_REPAIR_KINDS = re.compile(
+    r"\b(types? of repairs?|repair types?|kinds? of repairs?|which repairs?)\b"
+    r"|\brepairs?\b[^?.]{0,50}\bequipment\b"
+    r"|\bequipment\b[^?.]{0,50}\brepairs?\b",
     re.I,
 )
 _AGGREGATE = re.compile(
@@ -215,10 +223,93 @@ def plan_memory(field: FieldQueries, store: Any, question: str, user_id: str, th
     return None, f"{question} (the wells meant are {', '.join(ids)})"
 
 
+# Things people reasonably ask about an oil field that this dataset does not record. Each entry: what to listen for,
+# the column names that would prove the data exists, and what it would be called in plain words.
+_ABSENT_TOPICS = [
+    (re.compile(r"\b(reservoir|pressures?|psi|kpa|bottom-?hole|formation)\b", re.I), ("press", "reservoir", "psi", "kpa"), "reservoir or well pressure"),
+    (re.compile(
+        r"\b(flow ?rates?|barrels? (?:of oil )?(?:per|a) day|bpd|bopd|production (?:rates?|volumes?|totals?)|oil (?:output|production|volumes?|yield)|how much oil"
+        r"|(?:most|least|top|highest|biggest|best|total|more|less)\s+(?:oil|barrels)|(?:produced|pumped|yielded)\s+(?:the\s+)?(?:most|least|more|less|highest|total)\b"
+        r"|(?:top|best|biggest|highest)\s+producers?|barrels (?:of oil )?(?:produced|pumped))\b",
+        re.I,
+    ), ("flow", "bopd", "bpd", "oil_rate", "production_vol"), "oil production volumes"),
+    (re.compile(r"\b(water ?cut|gas[- ]oil|gor|salinity|porosity|permeability)\b", re.I), ("water_cut", "gor", "porosity", "permeab", "salin"), "fluid or rock properties"),
+    (re.compile(r"\b(well depth|true vertical depth|tvd|measured depth)\b", re.I), ("depth", "tvd"), "well depth"),
+]
+_HAS = "The records hold weekly air and wellhead temperatures, spills, repairs, regulator events and notes."
+
+
+def _recorded_columns(field: FieldQueries) -> set[str]:
+    rows = field.store.query(
+        "SELECT column_name FROM information_schema.columns WHERE table_name IN (" + ", ".join("?" * len(field.QUERYABLE)) + ")",
+        list(field.QUERYABLE),
+    )
+    return {r["column_name"].lower() for r in rows}
+
+
+def _not_in_the_data(field: FieldQueries, question: str) -> dict | None:
+    """If the question needs a kind of data the records do not hold, say so plainly instead of guessing or showing a menu."""
+    columns = _recorded_columns(field)
+    missing = []
+    for pattern, column_hints, label in _ABSENT_TOPICS:
+        if pattern.search(question) and not any(hint in column for column in columns for hint in column_hints):
+            missing.append(label)
+    if not missing:
+        return None
+    what = " and ".join(missing)
+    parts = [f"I can't answer that: this dataset has no data on {what}. {_HAS}"]
+    if "reservoir or well pressure" in missing:
+        parts.append(
+            "The only pressure figures are equipment ratings in the manuals, which describe the hardware, not the reservoir, "
+            "and nothing here describes the reservoir, so I can't confirm that the wells share one."
+        )
+    result = {"missing": missing}
+    if "oil production volumes" in missing:
+        year = _year_in(question, field.today)
+        weeks = field.store.query(
+            """
+            SELECT asset_id, count(*) AS weeks_inspected, count(*) FILTER (WHERE producing) AS weeks_producing
+            FROM inspection_status WHERE year(inspected_at) = ?
+            GROUP BY asset_id ORDER BY weeks_producing DESC, asset_id
+            """,
+            [year],
+        )
+        if weeks:
+            best = weeks[0]["weeks_producing"]
+            tied = [w for w in weeks if w["weeks_producing"] == best]
+            every = tied[0]["weeks_inspected"] == best
+            level = f"in all {best} of their weekly inspections" if every else f"in {best} of their weekly inspections"
+            parts.append(
+                f"The closest measure is how often a well was found producing: in {year}, {len(tied)} wells were producing {level}, so they tie "
+                "and that cannot rank them by oil either."
+            )
+            result["proxy"] = {"year": year, "most_weeks_producing": best, "wells_at_that_level": len(tied)}
+    parts.append("I can show which wells are producing now, or where recent spills happened.")
+    return {
+        "visual": "answer", "title": "Not in the data", "tool": "data_availability", "arguments": {"asked_about": missing},
+        "result": result, "answer": " ".join(parts), "tools_used": [{"tool": "data_availability", "arguments": {"asked_about": missing}}], "model": False,
+    }
+
+
 def plan(field: FieldQueries, question: str) -> dict[str, Any] | None:
     """A finished answer payload, or None when the question needs the usual tools and model."""
     has_well, has_area = bool(_WELL_ID.search(question)), bool(_AREA.search(question))
     types = types_in(question)
+
+    if re.search(r"\bbypass(?:es)?\b", question, re.IGNORECASE):
+        result = field.flowline_bypasses()
+        return _payload("flowline_bypasses", {}, result, result["summary"])
+
+    absent = _not_in_the_data(field, question)
+    if absent:
+        return absent
+
+    if re.search(r"\b(letter|commission)\b", question, re.I) and re.search(r"\bspills?\b", question, re.I):
+        result = field.spill_letter_compliance()
+        if result.get("error"):
+            return {"visual": "answer", "title": "The letter", "tool": "spill_letter_compliance", "arguments": {}, "result": result,
+                    "answer": result["error"], "tools_used": [{"tool": "spill_letter_compliance", "arguments": {}}], "model": False}
+        return _payload("spill_letter_compliance", {}, result, result["summary"])
 
     pair = readings(question)
     if pair and not has_well:
@@ -226,6 +317,10 @@ def plan(field: FieldQueries, question: str) -> dict[str, Any] | None:
         result = field.evaluate_reading(air, wellhead, types[0] if types else None, types)
         args = {"ambient_c": air, "wellhead_c": wellhead, "well_type": types[0] if types else None}
         return _payload("evaluate_reading", args, result, _reading_answer(result))
+
+    if not has_well and not has_area and _REPAIR_KINDS.search(question):
+        result = field.repair_kinds()
+        return _payload("repair_kinds", {}, result, result["summary"])
 
     if not has_well and not has_area and _COUNT_WELLS.search(question):
         result = field.fleet_summary()

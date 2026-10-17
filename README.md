@@ -17,7 +17,7 @@ pip install -e backend
 python -m uvicorn aicopilot.api:app --app-dir backend/src --host 127.0.0.1 --port 8080
 ```
 
-The first start loads `sample-data/` into a local DuckDB file under `backend/data/`. That folder is not committed.
+The first start loads `test-data/dataset/` into a local DuckDB file under `backend/data/`. Today in that dataset is 15 Jan 2027. The database folder is not committed.
 
 Frontend, in another terminal:
 

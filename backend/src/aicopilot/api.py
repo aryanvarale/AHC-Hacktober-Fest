@@ -15,10 +15,10 @@ from aicopilot.adapters import DuckDBStore
 from aicopilot.agent import ask_model
 from aicopilot.agui import stream_run
 from aicopilot.evidence import lookup as lookup_evidence
-from aicopilot import memory
+from aicopilot import feedback, memory
 from aicopilot.planner import plan, plan_memory
 from aicopilot.config import get_settings
-from aicopilot.ingest import ingest
+from aicopilot.ingest import ingest, is_complete
 from aicopilot.queries import FieldQueries
 
 STATIC = Path(__file__).parent / "static" / "index.html"
@@ -59,7 +59,7 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     def startup() -> None:
         global store, queries
-        if not settings.db_path.exists():
+        if not is_complete(settings.db_path):   # missing, or left half-loaded by an interrupted build
             ingest(settings.data_dir, settings.db_path)
         store = DuckDBStore(settings.db_path)
         queries = FieldQueries(store, settings.today)
@@ -107,6 +107,12 @@ def create_app() -> FastAPI:
     def compute(question: str, user_id: str = "U-201", history: list[dict] | None = None, thread_id: str = "") -> dict:
         field = _ready()
         started = perf_counter()
+        # a correction, a rule or a note from a person is written down first (and reaches every later answer)
+        recorded = feedback.handle(field, store, question, user_id, settings.today, settings.data_dir)
+        if recorded:
+            recorded["path"] = "database"
+            recorded["elapsed_ms"] = round((perf_counter() - started) * 1000, 1)
+            return recorded
         # "the three wells we discussed yesterday": this user's own earlier chats, never anyone else's
         remembered, question = plan_memory(field, store, question, user_id, thread_id, settings.today)
         if remembered:
@@ -208,6 +214,9 @@ def _area_name(text: str) -> str | None:
     names = {
         "northeast block 7": "Northeast Block 7",
         "northeast block 8": "Northeast Block 8",
+        "northwest block 12": "Northwest Block 12",
+        "southeast block 31": "Southeast Block 31",
+        "southeast block 32": "Southeast Block 32",
         "southwest block 23": "Southwest Block 23",
         "southwest block 24": "Southwest Block 24",
     }

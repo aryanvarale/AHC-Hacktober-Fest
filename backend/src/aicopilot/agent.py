@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sys
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 from urllib import error, request
 
@@ -225,7 +225,8 @@ def ask_model(field: FieldQueries, question: str, settings: Settings, history: l
     context = _context(history)
     earlier = " ".join(m["content"] for m in (history or [])[-6:] if m.get("role") == "user")
     request_text = f"{earlier} {question}"
-    decision_ms, choice = _decide(question, settings, today, context)
+    area_names = ", ".join(a["name"] for a in field.areas())
+    decision_ms, choice = _decide(question, settings, today, context, area_names)
     exact = _exact_well(question, field)
     loose = None if exact else _loose_well(question, field)
     assumed = None
@@ -249,7 +250,7 @@ def ask_model(field: FieldQueries, question: str, settings: Settings, history: l
         if choice["tool"] in _ASSET_TOOLS:
             choice["arguments"]["asset_id"] = exact
         else:
-            choice = _tool_for_exact(request_text, exact)
+            choice = _tool_for_exact(request_text, exact, today.year)
     if choice["tool"] in _ASSET_TOOLS and not exact and not loose and not _refers_back(question):
         # the router only found this well in the earlier conversation, and this question does not point back at it
         choice = {"tool": "none", "arguments": {}}
@@ -424,7 +425,7 @@ def _exact_well(question: str, field: FieldQueries) -> str | None:
     return asset if field.well_exists(asset) else None
 
 
-def _tool_for_exact(question: str, asset: str) -> dict:
+def _tool_for_exact(question: str, asset: str, year: int) -> dict:
     text = question.lower()
     if "spill" in text:
         return {"tool": "spills_for_well", "arguments": {"asset_id": asset}}
@@ -435,8 +436,8 @@ def _tool_for_exact(question: str, asset: str) -> dict:
     if re.search(r"temp|hot|cold|overheat|normal", text):
         return {"tool": "temperature_status", "arguments": {"asset_id": asset}}
     if "downtime" in text or re.search(r"\bdays\b", text):
-        year = re.search(r"20\d{2}", question)
-        return {"tool": "downtime_days", "arguments": {"asset_id": asset, "year": int(year.group(0)) if year else 2026}}
+        found = re.search(r"20\d{2}", question)
+        return {"tool": "downtime_days", "arguments": {"asset_id": asset, "year": int(found.group(0)) if found else year}}
     return {"tool": "well_status", "arguments": {"asset_id": asset}}
 
 
@@ -445,6 +446,9 @@ def _area_name(question: str) -> str | None:
     names = {
         "northeast block 7": "Northeast Block 7",
         "northeast block 8": "Northeast Block 8",
+        "northwest block 12": "Northwest Block 12",
+        "southeast block 31": "Southeast Block 31",
+        "southeast block 32": "Southeast Block 32",
         "southwest block 23": "Southwest Block 23",
         "southwest block 24": "Southwest Block 24",
     }
@@ -544,11 +548,12 @@ def _payload(answer: str, used: list[dict]) -> dict:
     }
 
 
-def _decide(question: str, settings: Settings, today: date, context: str = "") -> tuple[float, dict]:
+def _decide(question: str, settings: Settings, today: date, context: str = "", areas: str = "") -> tuple[float, dict]:
     names = ", ".join(item["function"]["name"] for item in _TOOLS)
+    start = today - timedelta(days=round(4 * 30.44))
     prompt = (
-        f"Today is {today.isoformat()}. Last 4 months is 2026-06-16 to 2026-10-16. "
-        "Areas: Northeast Block 7, Northeast Block 8, Southwest Block 23, Southwest Block 24. "
+        f"Today is {today.isoformat()}. Last 4 months is {start.isoformat()} to {today.isoformat()}. "
+        f"Areas: {areas}. "
         f"Tools: {names}. "
         "Copy a well id exactly as written. WELL-0001 stays WELL-0001, and a short id such as well-001 stays WELL-001. "
         "temperature_status answers last temperature, whether it is normal, and since when it is abnormal. "
@@ -616,8 +621,11 @@ def _chat(question: str, settings: Settings, today: date, context: str = "") -> 
         "You answer from field records about wells: whether a well is producing, downtime, spills, "
         "temperatures, maps and spill heatmaps by area. The records hold wells only, not tanks. "
         "Reply briefly and naturally. Keep the earlier conversation in mind and do not ask again for "
-        "something the operator already said. If the operator asked for data but left out a well id or "
-        "area, ask for it. Do not invent any field facts.\n"
+        "something the operator already said. Ask for a well id or area only when the question is about one "
+        "specific well or area and names none. If the question is about the whole field, or asks for something the "
+        "records do not hold (oil volumes, pressure, flow rates, depth), do not ask for an id: say plainly that it is "
+        "not recorded, and say what the records do hold (weekly air and wellhead temperatures, spills, repairs, "
+        "regulator events and notes). Do not invent any field facts.\n"
         + (f"Earlier conversation:\n{context}\n" if context else "")
         + f"Operator: {question}"
     )
@@ -653,6 +661,10 @@ def _answer(question: str, tool: str, result: dict, settings: Settings, today: d
             "If the result has an inspections_note, include it in your own words; otherwise do not mention it. "
             "If the operator said above normal but the reading is below normal, say clearly that it is below normal. "
             "Make sure every sentence agrees with the others. "
+        "If the result has corrections, say what was corrected, from what to what, by whom (corrected_by) and why, and that the original is kept. "
+        "If it has correction_conflict, state that disagreement plainly. "
+        "If it has corrected_to_producing, name those wells and say they are no longer listed because that person corrected their reading. "
+        "If it has upcoming_notes, say what is planned, from when, and whose statement it is (author_name), as that person's note and not a confirmed record. "
             "If the result gives a time limit, use it. Never ask the operator for that limit. "
             "The UI renders requested charts, graphs, tables, maps and heatmaps from this result. "
             "When a visual was requested, introduce it briefly; never claim you cannot generate or display it. "

@@ -3,11 +3,14 @@ the answer is allowed to cite. The model is expected to call these, not scan fil
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from aicopilot.adapters import DuckDBStore
+from aicopilot.config import DATA_DIR
 
 
 def _well_rank(num: str, digits: str, padded: str) -> tuple | None:
@@ -37,6 +40,57 @@ def _spill_class(barrels: float) -> str:
     return "Major"
 
 
+_BYPASS_IN = re.compile(
+    r"\b(?:bypass installed|had the bypass installed|put the bypass in|temporary bypass in place|bypass in place)\b",
+    re.IGNORECASE,
+)
+_BYPASS_OUT = re.compile(
+    r"\b(?:bypass removed|bypass pulled|took the bypass out)\b",
+    re.IGNORECASE,
+)
+
+
+def _bypass_approvals(sops: Path) -> dict[str, dict]:
+    """The MOC that currently authorizes a bypass on each well, after extensions replace earlier expiry dates."""
+    coverage: dict[str, dict] = {}
+    if not sops.exists():
+        return coverage
+    for path in sorted(sops.glob("moc-*.md")):
+        text = path.read_text(encoding="utf-8")
+        if "flowline bypass" not in text.lower():
+            continue
+        expires = re.search(r"expires on (\d{1,2} \w+ \d{4})", text, re.IGNORECASE)
+        if not expires:
+            continue
+        memo = path.stem.upper()
+        expiry = datetime.strptime(expires.group(1), "%d %b %Y").date()
+        for well in re.findall(r"WELL-\d{4}", text):
+            coverage[well] = {"memo": memo, "expires": expiry}
+    return coverage
+
+
+def _bypass_row(asset_id: str, area: str, opened: dict, closed: dict | None, approvals: dict[str, dict], today: date) -> dict:
+    approval = approvals.get(asset_id)
+    started = date.fromisoformat(opened["created_at"][:10])
+    ended = date.fromisoformat(closed["created_at"][:10]) if closed else None
+    if approval is None:
+        status = "Not approved"
+    elif (ended or today) > approval["expires"]:
+        status = "Expired"
+    else:
+        status = "Allowed"
+    return {
+        "Well": asset_id,
+        "Area": area,
+        "Bypass in": _day(started),
+        "Bypass out": "still in" if ended is None else _day(ended),
+        "Approval": approval["memo"] if approval else "none",
+        "Approval valid until": _day(approval["expires"]) if approval else "—",
+        "Status": status,
+        "evidence": [opened["note_id"]] + ([closed["note_id"]] if closed else []),
+    }
+
+
 def _day(value: Any) -> str:
     moment = date.fromisoformat(str(value)[:10])
     return f"{moment.day} {moment:%b %Y}"
@@ -53,6 +107,10 @@ def _iso(value: Any) -> Any:
     if isinstance(value, float):
         return round(value, 4)
     return value
+
+
+def _n_(value: float) -> str:
+    return f"{round(float(value), 2):g}"
 
 
 def _clean(row: dict) -> dict:
@@ -115,9 +173,43 @@ class FieldQueries:
                 [asset_id, self.today.isoformat(), self.today.isoformat()],
             )
         ]
+        status["upcoming_notes"] = [
+            _clean(row) for row in self.store.query(
+                """
+                SELECT n.note_id, n.note_type, n.text, u.name AS author_name, n.valid_from, n.valid_to
+                FROM notes n
+                LEFT JOIN users u ON u.user_id = n.author_user_id
+                WHERE n.asset_id = ? AND n.valid_from > ?
+                ORDER BY n.valid_from
+                """,
+                [asset_id, self.today.isoformat()],
+            )
+        ]
+        status["corrections"] = self._corrections_on(status)
+        note = (status.get("notes") or "").strip()
+        if status["corrections"] and note and status["producing"] and re.search(r"not moving|no stroke|shut|stopped|down|idle|stuck", note, re.IGNORECASE):
+            status["correction_conflict"] = (
+                f"The inspector's note \"{note}\" ({status.get('inspector_name')}) disagrees with the corrected reading, which says the well is producing."
+            )
         status["reason"] = self._downtime_reason(status)
-        status["evidence"] = [status["inspection_id"], *[n["note_id"] for n in status["active_notes"]]]
+        status["evidence"] = [status["inspection_id"], *[n["note_id"] for n in status["active_notes"]], *[n["note_id"] for n in status["upcoming_notes"]]]
         return status
+
+    def _corrections_on(self, row: dict) -> list[dict]:
+        """The corrections applied to one inspection: what, from what, to what, by whom, why. The original stays on file."""
+        out = []
+        for column, by, reason, original, now in (
+            ("wellhead_temp_c", "temp_corrected_by", "temp_correction_reason", "temp_original_value", "wellhead_temp_c"),
+            ("spill_est_volume_bbl", "volume_corrected_by", "volume_correction_reason", "volume_original_value", "spill_est_volume_bbl"),
+            ("spill_detected", "spill_corrected_by", "spill_correction_reason", "spill_detected_original", "spill_detected"),
+        ):
+            if row.get(by):
+                names = self.store.query("SELECT name FROM users WHERE user_id = ?", [row[by]])
+                out.append({
+                    "field": column, "original": row.get(original), "corrected": row.get(now),
+                    "corrected_by": names[0]["name"] if names else row[by], "reason": row.get(reason),
+                })
+        return out
 
     def temperature_status(self, asset_id: str, limit: int = 26) -> dict:
         """Last reading, the normal range, and when the current out-of-range streak began."""
@@ -293,13 +385,35 @@ class FieldQueries:
                 "reason": item["reason"],
                 "inspection_id": item["inspection_id"],
             })
-        return {
+        gone = self.store.query(
+            """
+            SELECT asset_id, inspection_id, wellhead_temp_original, wellhead_temp_c, ambient_temp_c, producing_delta_c,
+                   temp_corrected_by, temp_correction_reason
+            FROM well_now
+            WHERE area_name = ? AND producing AND temp_corrected_by IS NOT NULL
+              AND (wellhead_temp_original - ambient_temp_c) < producing_delta_c
+            ORDER BY asset_id
+            """,
+            [area_name],
+        )
+        left_list = []
+        for row in gone:
+            names = self.store.query("SELECT name FROM users WHERE user_id = ?", [row["temp_corrected_by"]])
+            left_list.append({
+                "asset_id": row["asset_id"], "inspection_id": row["inspection_id"],
+                "original_wellhead_c": row["wellhead_temp_original"], "corrected_wellhead_c": row["wellhead_temp_c"],
+                "corrected_by": names[0]["name"] if names else row["temp_corrected_by"], "reason": row["temp_correction_reason"],
+            })
+        result = {
             "area": area_name,
             "count": len(wells),
             "wells": wells,
-            "evidence": [w["inspection_id"] for w in wells],
+            "evidence": [w["inspection_id"] for w in wells] + [w["inspection_id"] for w in left_list],
             "visual": "table",
         }
+        if left_list:
+            result["corrected_to_producing"] = left_list  # on the list before a correction, producing now
+        return result
 
     def timeseries(self, asset_id: str, weeks: int = 13) -> dict:
         start = self.today - timedelta(days=weeks * 7)
@@ -717,110 +831,116 @@ class FieldQueries:
         }
 
     def _rule_number(self, parameter: str, scope: str, fallback: float) -> float:
+        """A rule's current value: the latest override by a person if there is one, else the manual's."""
+        override = self.store.query(
+            "SELECT numeric_value FROM rule_overrides WHERE parameter = ? AND scope_value = ? ORDER BY created_at DESC, override_id DESC LIMIT 1",
+            [parameter, scope],
+        )
+        if override:
+            return override[0]["numeric_value"]
         rows = self.store.query(
             "SELECT numeric_value FROM rules WHERE parameter = ? AND scope_value = ?",
             [parameter, scope],
         )
         return rows[0]["numeric_value"] if rows else fallback
 
-    # ── the whole dataset at a glance ──────────────────────────────────────────────────
+    # ── the regulator's letter about spill clean-ups ─────────────────────────────────────
 
-    def fleet_summary(self) -> dict:
-        """How many wells there are, by type, area and current status. Exact counts, straight from the tables."""
-        one = lambda sql: self.store.query(sql)[0]
-        total = one("SELECT count(*) AS n FROM wells")["n"]
-        by_type = self.store.query("SELECT well_type, count(*) AS n FROM wells GROUP BY 1 ORDER BY 1")
-        by_area = self.store.query(
-            "SELECT a.name AS area_name, count(*) AS n FROM wells w JOIN areas a ON a.area_id = w.area_id GROUP BY 1 ORDER BY 1"
+    def spill_letter_compliance(self) -> dict:
+        """Which reportable spills the State Oil & Gas Commission's letter covers, and which of them are not compliant.
+
+        The letter covers every reportable spill in the blocks it names since the date it gives, except spills later
+        confirmed not to be crude oil (after corrections those are no longer spills). HSE's note on the letter says a
+        spill is compliant only if its clean-up report has the required sentence in "Spill clean-up and waste"; field
+        soil readings taken on site do not count. Everything is read from the letter, so a new letter is picked up as it is.
+        """
+        letters = sorted((DATA_DIR / "fleet" / "sops").glob("regulator-letter-*.md"))
+        if not letters:
+            return {"error": "No regulator letter is loaded."}
+        text = letters[-1].read_text(encoding="utf-8")
+
+        def day(value: str):
+            for fmt in ("%d %b %Y", "%d %B %Y"):
+                try:
+                    return datetime.strptime(" ".join(value.split()), fmt).date()
+                except ValueError:
+                    pass
+            return None
+
+        scope = re.search(r"For every reportable spill in (.+?) since (\d{1,2}\s+\w+\s+\d{4})", text, re.S)
+        due = re.search(r"submitted by (\d{1,2}\s+\w+\s+\d{4})", text)
+        sentence = re.search(r'contains the sentence\s+"([^"]+)"', text)
+        written = re.search(r"\*\*Date:\*\*\s*(\d{1,2}\s+\w+\s+\d{4})", text)
+        if not (scope and sentence):
+            return {"error": "The letter does not state which spills it covers or what a compliant clean-up report must say."}
+        known = [r["name"] for r in self.store.query("SELECT name FROM areas")]
+        areas = [a for a in known if a.lower() in scope.group(1).lower()]
+        since = day(scope.group(2))
+        needed = sentence.group(1)
+        results_due = day(due.group(1)) if due else None
+        threshold = self._rule_number("reportable_bbl", "SR-01", 5)
+        if not areas or not since:
+            return {"error": "I could not read the blocks or the start date from the letter."}
+
+        marks = ", ".join("?" for _ in areas)
+        spills = self.store.query(
+            f"""
+            SELECT inspection_id, asset_id, well_name, area_name, inspected_at, spill_est_volume_bbl
+            FROM spills_effective
+            WHERE area_name IN ({marks}) AND inspected_at::DATE >= ? AND spill_est_volume_bbl >= ?
+            ORDER BY inspected_at
+            """,
+            [*areas, since.isoformat(), threshold],
         )
-        by_type_area = self.store.query(
-            "SELECT a.name AS area_name, w.well_type, count(*) AS n FROM wells w JOIN areas a ON a.area_id = w.area_id GROUP BY 1, 2 ORDER BY 1, 2"
-        )
-        now = self.store.query("SELECT producing, count(*) AS n FROM well_now GROUP BY 1")
-        recorded = self.store.query("SELECT recorded_status, count(*) AS n FROM wells GROUP BY 1 ORDER BY 1")
-        span = one("SELECT count(*) AS n, min(inspected_at) AS first, max(inspected_at) AS last FROM inspections")
-        producing = next((r["n"] for r in now if r["producing"]), 0)
-        breakdown = (
-            [{"group": "all wells", "value": "total", "wells": total}]
-            + [{"group": "well type", "value": r["well_type"], "wells": r["n"]} for r in by_type]
-            + [{"group": "area", "value": r["area_name"], "wells": r["n"]} for r in by_area]
-            + [{"group": "producing now", "value": "producing" if r["producing"] else "not producing", "wells": r["n"]} for r in now]
+        rows, evidence = [], []
+        for s in spills:
+            reports = self.store.query(
+                "SELECT maintenance_id, report_file FROM maintenance WHERE triggered_by_inspection_id = ? ORDER BY started_at",
+                [s["inspection_id"]],
+            )
+            compliant_with, why, shown = None, "No clean-up report is on file for this spill", "none"
+            for rep in reports:
+                shown = rep["maintenance_id"]
+                body = ""
+                if rep["report_file"]:
+                    try:
+                        body = (DATA_DIR / "assets" / s["asset_id"] / rep["report_file"]).read_text(encoding="utf-8")
+                    except OSError:
+                        body = ""
+                section = re.search(r"##\s*Spill clean-up and waste\s*\n(.*?)(?=\n##|\Z)", body, re.S)
+                if section and needed.lower() in section.group(1).lower():
+                    compliant_with, why = rep["maintenance_id"], f'The clean-up report says "{needed}"'
+                    break
+                if section:
+                    why = f'The clean-up report ({rep["maintenance_id"]}) has no line "{needed}"' + (" (only field soil readings)" if "sample" in section.group(1).lower() else "")
+                else:
+                    why = f"The report {rep['maintenance_id']} has no spill clean-up section"
+            ok = compliant_with is not None
+            rows.append({
+                "Well": s["asset_id"], "Area": s["area_name"], "Spill date": f"{s['inspected_at']:%d %b %Y}",
+                "Barrels": round(s["spill_est_volume_bbl"], 1), "Clean-up report": compliant_with or shown,
+                "Status": "Compliant" if ok else "Not compliant", "Why": why,
+            })
+            evidence += [s["inspection_id"], *([compliant_with or shown] if (compliant_with or shown) != "none" else [])]
+        rows.sort(key=lambda r: (r["Status"] == "Compliant", r["Spill date"] and datetime.strptime(r["Spill date"], "%d %b %Y"), r["Well"]))
+        bad = [r for r in rows if r["Status"] != "Compliant"]
+        names = areas[0] if len(areas) == 1 else ", ".join(areas[:-1]) + " and " + areas[-1]
+        listed = "; ".join(f"{r['Well']} ({r['Spill date']}, {r['Barrels']} bbl)" for r in bad[:12]) + (f"; and {len(bad) - 12} more" if len(bad) > 12 else "")
+        left = ""
+        if results_due:
+            gap = (results_due - self.today).days
+            left = f" Results are due by {results_due:%d %b %Y}" + (", which is today." if gap == 0 else f", {gap} day{'s' if gap != 1 else ''} away." if gap > 0 else f", {-gap} day{'s' if gap != -1 else ''} ago.")
+        summary = (
+            f"The Commission's letter of {day(written.group(1)):%d %b %Y} covers every reportable spill ({_n_(threshold)} bbl or more) in {names} since {since:%d %b %Y}, "
+            f"except spills later confirmed not to be crude oil: {len(rows)} spills. {len(rows) - len(bad)} are compliant, because their clean-up report says \"{needed}\". "
+            + (f"{len(bad)} are not: {listed}." if bad else "None is non-compliant.")
+            + left + " Field soil readings taken on site do not count."
         )
         return {
-            "total_wells": total,
-            "by_type": {r["well_type"]: r["n"] for r in by_type},
-            "by_area": {r["area_name"]: r["n"] for r in by_area},
-            "by_type_and_area": [_clean(r) for r in by_type_area],
-            "producing_now": producing,
-            "not_producing_now": total - producing,
-            "recorded_status": {r["recorded_status"]: r["n"] for r in recorded},
-            "inspections": span["n"],
-            "inspections_from": _iso(span["first"]),
-            "inspections_to": _iso(span["last"]),
-            "breakdown": breakdown,
-            "evidence": [],
+            "letter": {"file": letters[-1].name, "areas": areas, "since": since.isoformat(), "results_due": results_due.isoformat() if results_due else None, "required_sentence": needed},
+            "covered": len(rows), "compliant": len(rows) - len(bad), "not_compliant": len(bad),
+            "rows": rows, "summary": summary, "evidence": list(dict.fromkeys(evidence))[:60],
         }
-
-    # ── free-form questions: one read-only SELECT over an allow-list ─────────────────────
-
-    QUERYABLE = (
-        "wells", "areas", "teams", "users", "equipment", "inspections", "inspection_status", "well_now",
-        "spills_effective", "maintenance", "reg_events", "notes", "corrections_latest", "rules",
-    )
-
-    def schema_text(self) -> str:
-        """Tables and columns the SQL writer may use. Text columns with few distinct values list them, so a
-        filter is written against what the data really contains instead of a guess ('repair' vs 'corrective')."""
-        cached = getattr(self, "_schema_cache", None)
-        if cached:
-            return cached
-        rows = self.store.query(
-            "SELECT table_name, column_name, data_type FROM information_schema.columns "
-            f"WHERE table_name IN ({', '.join('?' * len(self.QUERYABLE))}) ORDER BY table_name, ordinal_position",
-            list(self.QUERYABLE),
-        )
-        tables: dict[str, list[str]] = {}
-        for r in rows:
-            label = f"{r['column_name']} {r['data_type']}"
-            if r["data_type"] == "VARCHAR" and not r["column_name"].endswith(("_id", "text", "detail", "notes", "reason", "issue", "action_taken", "name")):
-                values = [
-                    v["v"] for v in self.store.query(
-                        f"SELECT DISTINCT {r['column_name']} AS v FROM {r['table_name']} WHERE {r['column_name']} IS NOT NULL LIMIT 13"
-                    )
-                ]
-                if 0 < len(values) <= 12 and all(len(str(v)) <= 32 for v in values):
-                    label += " one of [" + ", ".join(f"'{v}'" for v in sorted(values)) + "]"
-            tables.setdefault(r["table_name"], []).append(label)
-        self._schema_cache = "\n".join(f"{name}({', '.join(cols)})" for name, cols in tables.items())
-        return self._schema_cache
-
-    _FORBIDDEN = re.compile(
-        r"\b(insert|update|delete|drop|create|alter|attach|detach|copy|pragma|install|load|export|import|call|set|"
-        r"vacuum|checkpoint|truncate|replace|merge|grant|read_csv|read_json|read_parquet|read_text|glob|httpfs)\b",
-        re.IGNORECASE,
-    )
-
-    def run_select(self, sql: str, limit: int = 200) -> dict:
-        """Run one SELECT the model wrote. Only the allow-listed tables, one statement, never a write."""
-        text = sql.strip().rstrip(";").strip()
-        if ";" in text:
-            return {"sql": sql, "error": "Only one statement is allowed."}
-        if not re.match(r"(?is)^\s*(select|with)\b", text):
-            return {"sql": sql, "error": "Only SELECT queries are allowed."}
-        if self._FORBIDDEN.search(text):
-            return {"sql": sql, "error": "That statement uses something that is not allowed."}
-        ctes = {m.lower() for m in re.findall(r"(?i)\b(\w+)\s+as\s*\(", text)}
-        used = re.findall(r"(?i)\b(?:from|join)\s+([A-Za-z_][\w\.]*)", text)
-        bad = sorted({u for u in used if u.lower() not in ctes and u.lower().split(".")[-1] not in self.QUERYABLE})
-        if bad:
-            return {"sql": sql, "error": f"Unknown table: {', '.join(bad)}. Use only: {', '.join(self.QUERYABLE)}."}
-        try:
-            rows = self.store.query(f"SELECT * FROM ({text}) AS q LIMIT {limit + 1}")
-        except Exception as exc:  # the message goes back to the model so it can fix the query
-            return {"sql": text, "error": str(exc).splitlines()[0][:300]}
-        truncated = len(rows) > limit
-        rows = [_clean(r) for r in rows[:limit]]
-        return {"sql": text, "columns": list(rows[0].keys()) if rows else [], "rows": rows, "row_count": len(rows), "truncated": truncated, "evidence": []}
 
     # ── rules from the manuals and SOPs, with any user override applied ──────────────────
 
@@ -895,8 +1015,9 @@ class FieldQueries:
     ) -> dict:
         """A made-up reading (no real well): the gap, and the verdict under every well type's own rule."""
         gap = round(float(wellhead_c) - float(ambient_c), 2)
+        known = self.well_type_rules()["types"]
         rows = []
-        for entry in self.well_type_rules()["types"]:
+        for entry in known:
             need, alarm = entry.get("producing_delta_c"), entry.get("temp_alarm_c")
             rows.append({
                 "well_type": entry["well_type"],
@@ -907,7 +1028,7 @@ class FieldQueries:
                 "above_alarm": None if alarm is None else float(wellhead_c) > alarm,
             })
         evidence = [
-            f"RULE-{rid}" for entry in self.well_type_rules()["types"]
+            f"RULE-{rid}" for entry in known
             for param, rid in entry.get("rule_ids", {}).items() if param in ("producing_delta_c", "temp_alarm_c")
         ]
         return {
@@ -918,6 +1039,172 @@ class FieldQueries:
             "types": rows,
             "rule": "A well is producing only when the wellhead is at least its type's required gap above the air.",
             "evidence": evidence,
+        }
+
+    # ── free-form questions: one read-only SELECT over an allow-list ─────────────────────
+
+    QUERYABLE = (
+        "wells", "areas", "teams", "users", "equipment", "inspections", "inspection_status", "well_now",
+        "spills_effective", "maintenance", "reg_events", "notes", "corrections_latest", "rules",
+    )
+
+    def schema_text(self) -> str:
+        """Tables and columns the SQL writer may use. Text columns with few distinct values list them, so a
+        filter is written against what the data really contains instead of a guess ('repair' vs 'corrective')."""
+        cached = getattr(self, "_schema_cache", None)
+        if cached:
+            return cached
+        rows = self.store.query(
+            "SELECT table_name, column_name, data_type FROM information_schema.columns "
+            f"WHERE table_name IN ({', '.join('?' * len(self.QUERYABLE))}) ORDER BY table_name, ordinal_position",
+            list(self.QUERYABLE),
+        )
+        tables: dict[str, list[str]] = {}
+        for r in rows:
+            label = f"{r['column_name']} {r['data_type']}"
+            if r["data_type"] == "VARCHAR" and not r["column_name"].endswith(("_id", "text", "detail", "notes", "reason", "issue", "action_taken", "name")):
+                values = [
+                    v["v"] for v in self.store.query(
+                        f"SELECT DISTINCT {r['column_name']} AS v FROM {r['table_name']} WHERE {r['column_name']} IS NOT NULL LIMIT 13"
+                    )
+                ]
+                if 0 < len(values) <= 12 and all(len(str(v)) <= 32 for v in values):
+                    label += " one of [" + ", ".join(f"'{v}'" for v in sorted(values)) + "]"
+            tables.setdefault(r["table_name"], []).append(label)
+        self._schema_cache = "\n".join(f"{name}({', '.join(cols)})" for name, cols in tables.items())
+        return self._schema_cache
+
+    _FORBIDDEN = re.compile(
+        r"\b(insert|update|delete|drop|create|alter|attach|detach|copy|pragma|install|load|export|import|call|set|"
+        r"vacuum|checkpoint|truncate|replace|merge|grant|read_csv|read_json|read_parquet|read_text|glob|httpfs)\b",
+        re.IGNORECASE,
+    )
+
+    def run_select(self, sql: str, limit: int = 200) -> dict:
+        """Run one SELECT the model wrote. Only the allow-listed tables, one statement, never a write."""
+        text = sql.strip().rstrip(";").strip()
+        if ";" in text:
+            return {"sql": sql, "error": "Only one statement is allowed."}
+        if not re.match(r"(?is)^\s*(select|with)\b", text):
+            return {"sql": sql, "error": "Only SELECT queries are allowed."}
+        if self._FORBIDDEN.search(text):
+            return {"sql": sql, "error": "That statement uses something that is not allowed."}
+        ctes = {m.lower() for m in re.findall(r"(?i)\b(\w+)\s+as\s*\(", text)}
+        used = re.findall(r"(?i)\b(?:from|join)\s+([A-Za-z_][\w\.]*)", text)
+        bad = sorted({u for u in used if u.lower() not in ctes and u.lower().split(".")[-1] not in self.QUERYABLE})
+        if bad:
+            return {"sql": sql, "error": f"Unknown table: {', '.join(bad)}. Use only: {', '.join(self.QUERYABLE)}."}
+        try:
+            rows = self.store.query(f"SELECT * FROM ({text}) AS q LIMIT {limit + 1}")
+        except Exception as exc:  # the message goes back to the model so it can fix the query
+            return {"sql": text, "error": str(exc).splitlines()[0][:300]}
+        truncated = len(rows) > limit
+        rows = [_clean(r) for r in rows[:limit]]
+        return {"sql": text, "columns": list(rows[0].keys()) if rows else [], "rows": rows, "row_count": len(rows), "truncated": truncated, "evidence": []}
+
+    def flowline_bypasses(self) -> dict:
+        """Temporary flowline bypasses, from operator notes, judged against the MOC memos (OPS-2)."""
+        approvals = _bypass_approvals(DATA_DIR / "fleet" / "sops")
+        areas = {
+            row["asset_id"]: row["area"]
+            for row in self.store.query(
+                "SELECT w.asset_id, a.name AS area FROM wells w JOIN areas a ON a.area_id = w.area_id"
+            )
+        }
+        notes: dict[str, list[dict]] = {}
+        for path in sorted((DATA_DIR / "assets").glob("*/context.jsonl")):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if row.get("note_type") != "operator_note" or "bypass" not in row.get("text", "").lower():
+                    continue
+                notes.setdefault(row["asset_id"], []).append(row)
+
+        rows = []
+        for asset_id, items in notes.items():
+            items.sort(key=lambda item: item["created_at"])
+            opened = None
+            for item in items:
+                text = item["text"]
+                if _BYPASS_OUT.search(text) and opened:
+                    rows.append(_bypass_row(asset_id, areas.get(asset_id, ""), opened, item, approvals, self.today))
+                    opened = None
+                elif _BYPASS_IN.search(text) and opened is None:
+                    opened = item
+            if opened:
+                rows.append(_bypass_row(asset_id, areas.get(asset_id, ""), opened, None, approvals, self.today))
+
+        shown = [row for row in rows if row["Bypass out"] == "still in" or row["Status"] != "Allowed"]
+        shown.sort(key=lambda row: (row["Bypass out"] != "still in", row["Well"]))
+        still = [row for row in shown if row["Bypass out"] == "still in"]
+        allowed = [row for row in still if row["Status"] == "Allowed"]
+        summary = (
+            f"{len(still)} temporary flowline bypass"
+            f"{' is' if len(still) == 1 else 'es are'} in place today"
+            f"{f', {len(allowed)} of them allowed' if still else ''}. "
+            f"{len(shown)} bypasses are listed: the ones in place now, and any past or present bypass "
+            f"that stayed in after its approval ran out or was never approved."
+        )
+        return {
+            "count": len(shown),
+            "in_place": len(still),
+            "rows": shown,
+            "summary": summary,
+            "evidence": [item for row in shown for item in row["evidence"]],
+        }
+
+    def fleet_summary(self) -> dict:
+        """How many wells, by type and area, and how many are producing right now."""
+        total = self.store.query("SELECT count(*) AS n FROM wells")[0]["n"]
+        by_type = {row["well_type"]: row["n"] for row in self.store.query(
+            "SELECT well_type, count(*) AS n FROM wells GROUP BY well_type ORDER BY well_type"
+        )}
+        by_area = {row["name"]: row["n"] for row in self.store.query(
+            "SELECT a.name, count(*) AS n FROM wells w JOIN areas a ON a.area_id = w.area_id GROUP BY a.name ORDER BY a.name"
+        )}
+        now = self.store.query(
+            "SELECT count(*) FILTER (WHERE producing) AS producing, count(*) FILTER (WHERE NOT producing) AS stopped FROM well_now"
+        )[0]
+        return {
+            "total_wells": total,
+            "by_type": by_type,
+            "by_area": by_area,
+            "producing_now": now["producing"],
+            "not_producing_now": now["stopped"],
+            "rows": [{"well_type": name, "wells": count} for name, count in by_type.items()],
+        }
+
+    def repair_kinds(self) -> dict:
+        """Every distinct repair, and the equipment it was done on, across the whole field."""
+        rows = self.store.query(
+            """
+            SELECT replace(equipment_kind, '_', ' ') AS equipment,
+                   issue AS repair,
+                   maintenance_type AS kind,
+                   count(*) AS jobs,
+                   count(DISTINCT asset_id) AS wells
+            FROM maintenance
+            GROUP BY equipment_kind, issue, maintenance_type
+            ORDER BY equipment_kind, jobs DESC, issue
+            """
+        )
+        rows = [_clean(row) for row in rows]
+        equipment = sorted({row["equipment"] for row in rows})
+        lines = []
+        for name in equipment:
+            jobs = [row for row in rows if row["equipment"] == name]
+            bits = [f"{row['repair']} ({row['kind']}, {row['jobs']} jobs)" for row in jobs]
+            lines.append(f"{name}: " + "; ".join(bits) + ".")
+        summary = (
+            f"{len(rows)} kinds of repair have been done across all wells, on {len(equipment)} kinds of equipment. "
+            + " ".join(lines)
+        )
+        return {
+            "count": len(rows),
+            "equipment_count": len(equipment),
+            "rows": rows,
+            "summary": summary,
         }
 
     def repair_cost(self, asset_ids: list[str], year: int) -> dict:
