@@ -917,15 +917,19 @@ class FieldQueries:
                     why = f"The report {rep['maintenance_id']} has no spill clean-up section"
             ok = compliant_with is not None
             rows.append({
-                "Well": s["asset_id"], "Area": s["area_name"], "Spill date": f"{s['inspected_at']:%d %b %Y}",
-                "Barrels": round(s["spill_est_volume_bbl"], 1), "Clean-up report": compliant_with or shown,
-                "Status": "Compliant" if ok else "Not compliant", "Why": why,
+                "Well": s["asset_id"], "Area": s["area_name"],
+                "Inspection": f"{s['inspection_id']} · {s['inspected_at'].day} {s['inspected_at']:%b %Y}",
+                "Volume (bbl)": round(s["spill_est_volume_bbl"], 1), "Clean-up job": compliant_with or shown,
+                "Compliant?": ("Yes" if ok else "No") + f" — {why}",
+                "_when": s["inspected_at"],
             })
             evidence += [s["inspection_id"], *([compliant_with or shown] if (compliant_with or shown) != "none" else [])]
-        rows.sort(key=lambda r: (r["Status"] == "Compliant", r["Spill date"] and datetime.strptime(r["Spill date"], "%d %b %Y"), r["Well"]))
-        bad = [r for r in rows if r["Status"] != "Compliant"]
+        rows.sort(key=lambda r: (r["Compliant?"].startswith("Yes"), r["_when"], r["Well"]))
+        for r in rows:
+            r.pop("_when")
+        bad = [r for r in rows if not r["Compliant?"].startswith("Yes")]
         names = areas[0] if len(areas) == 1 else ", ".join(areas[:-1]) + " and " + areas[-1]
-        listed = "; ".join(f"{r['Well']} ({r['Spill date']}, {r['Barrels']} bbl)" for r in bad[:12]) + (f"; and {len(bad) - 12} more" if len(bad) > 12 else "")
+        listed = "; ".join(f"{r['Well']} ({r['Inspection'].split(' · ')[1]}, {r['Volume (bbl)']} bbl)" for r in bad[:12]) + (f"; and {len(bad) - 12} more" if len(bad) > 12 else "")
         left = ""
         if results_due:
             gap = (results_due - self.today).days

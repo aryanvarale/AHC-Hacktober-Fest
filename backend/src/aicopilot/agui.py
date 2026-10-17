@@ -180,7 +180,7 @@ def _table_columns(tool: str | None, rows: list[dict]) -> list[str]:
         "repair_kinds": ["equipment", "repair", "kind", "jobs", "wells"],
         "fleet_summary": ["well_type", "wells"],
         "flowline_bypasses": ["Well", "Area", "Bypass in", "Bypass out", "Approval", "Approval valid until", "Status"],
-        "spill_letter_compliance": ["Well", "Area", "Spill date", "Barrels", "Clean-up report", "Status", "Why"],
+        "spill_letter_compliance": ["Well", "Area", "Inspection", "Volume (bbl)", "Clean-up job", "Compliant?"],
     }.get(tool, [])
     if rows and rows[0].get("asset_id") and not preferred:
         preferred = ["asset_id", "status", "area", "delta_c", "inspection_id"]
